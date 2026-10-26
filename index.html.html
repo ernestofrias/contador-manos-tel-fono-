@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Contador con manos</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<style>
+  :root { box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+  body { font-family: sans-serif; background: #1b1b1f; color: #f1f1f1; margin: 0; padding: 16px; text-align: center; }
+  h1 { font-size: 24px; margin: 4px 0 12px; }
+  #estado { min-height: 22px; margin-bottom: 12px; color: #9fd8c4; }
+  button { font-size: 18px; padding: 12px 18px; margin: 4px; border: 0; border-radius: 10px; background: #1D9E75; color: white; cursor: pointer; }
+  button:disabled { background: #555; cursor: default; }
+  #visor { position: relative; width: 100%; max-width: 640px; margin: 14px auto; background: #000; border-radius: 12px; overflow: hidden; }
+  #video, #lienzo { width: 100%; display: block; transform: scaleX(-1); }
+  #lienzo { position: absolute; top: 0; left: 0; height: 100%; }
+  #numero { font-size: 90px; font-weight: bold; letter-spacing: 6px; margin: 6px 0; }
+  .fila { display: flex; justify-content: center; gap: 24px; flex-wrap: wrap; font-size: 18px; }
+  #debug { margin-top: 10px; font-size: 14px; color: #aaa; white-space: pre-line; }
+  table { margin: 16px auto 0; border-collapse: collapse; font-size: 14px; }
+  td, th { border: 1px solid #444; padding: 4px 10px; }
+</style>
+</head>
+<body>
+<h1>Contador con manos</h1>
+<div id="estado">Paso 1: conecta la ESP32 por Bluetooth. Paso 2: inicia la cámara.</div>
+
+<button id="btnSerial">1. Conectar ESP32 (Bluetooth)</button>
+<button id="btnCamara">2. Iniciar cámara</button>
+
+<div id="visor">
+  <video id="video" playsinline muted></video>
+  <canvas id="lienzo"></canvas>
+</div>
+
+<div id="numero">--</div>
+<div class="fila">
+  <div>Decenas (mano izquierda): <b id="dec">-</b></div>
+  <div>Unidades (mano derecha): <b id="uni">-</b></div>
+  <div>Enviado a la ESP32: <b id="enviado">-</b></div>
+</div>
+<div id="debug"></div>
+
+<table>
+  <tr><th>Número</th><th>Dedos levantados</th></tr>
+  <tr><td>0</td><td>Puño cerrado</td></tr>
+  <tr><td>1</td><td>Índice</td></tr>
+  <tr><td>2</td><td>Índice y medio</td></tr>
+  <tr><td>3</td><td>Índice, medio y anular</td></tr>
+  <tr><td>4</td><td>Cuatro dedos, sin pulgar</td></tr>
+  <tr><td>5</td><td>Mano abierta</td></tr>
+  <tr><td>6</td><td>Pulgar y meñique</td></tr>
+  <tr><td>7</td><td>Pulgar e índice</td></tr>
+  <tr><td>8</td><td>Pulgar, índice y medio</td></tr>
+  <tr><td>9</td><td>Pulgar, índice, medio y anular</td></tr>
+</table>
+
+<script>
+// ----------------- Ajustes (se pueden cambiar si la detección falla) -----------------
+const UMBRAL_DEDO = 1.1;       // un dedo cuenta como levantado si su punta está más lejos de la muñeca que su articulación
+const UMBRAL_PULGAR = 0.55;    // separación mínima del pulgar respecto al índice para contarlo como levantado
+const FOTOGRAMAS_ESTABLES = 5; // cuántos fotogramas seguidos debe repetirse un número antes de enviarlo
+
+// Patrón de dedos (pulgar, índice, medio, anular, meñique) -> número
+const GESTOS = {
+  "00000": 0, "01000": 1, "01100": 2, "01110": 3, "01111": 4,
+  "11111": 5, "10001": 6, "11000": 7, "11100": 8, "11110": 9
+};
+
+const CONEXIONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+                    [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+// ----------------- Elementos de la página -----------------
+const $ = (id) => document.getElementById(id);
+const video = $("video");
+const lienzo = $("lienzo");
+const ctx = lienzo.getContext("2d");
+
+function estado(texto) { $("estado").textContent = texto; }
+
+// ----------------- Conexión con la ESP32 (Bluetooth, Web Bluetooth) -----------------
+const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+let dispositivo = null;
+let caracteristica = null;
+let enviando = false;
+let pendiente = null;
+const codificador = new TextEncoder();
+
+async function conectarESP32() {
+  if (!("bluetooth" in navigator)) {
+    estado("Este navegador no permite Bluetooth. Usa Chrome en un teléfono Android.");
+    return;
+  }
+  try {
+    estado("Buscando la ESP32...");
+    dispositivo = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+    dispositivo.addEventListener("gattserverdisconnected", alDesconectar);
+    const servidor = await dispositivo.gatt.connect();
+    const servicio = await servidor.getPrimaryService(SERVICE_UUID);
+    caracteristica = await servicio.getCharacteristic(CHARACTERISTIC_UUID);
+    $("btnSerial").textContent = "ESP32 conectada";
+    $("btnSerial").disabled = true;
+    estado("ESP32 conectada por Bluetooth.");
+    if (valorEnviado !== null) enviar(valorEnviado);
+  } catch (e) {
+    estado("No se pudo conectar la ESP32: " + e.message);
+  }
+}
+
+function alDesconectar() {
+  caracteristica = null;
+  $("btnSerial").disabled = false;
+  $("btnSerial").textContent = "1. Conectar ESP32 (Bluetooth)";
+  estado("Se perdió la conexión Bluetooth. Presiona el botón 1 para reconectar.");
+}
+
+async function enviar(numero) {
+  pendiente = numero;
+  if (!caracteristica || enviando) return;
+  enviando = true;
+  while (pendiente !== null && caracteristica) {
+    const valor = pendiente;
+    pendiente = null;
+    try {
+      const datos = codificador.encode(String(valor));
+      if (caracteristica.writeValueWithoutResponse) await caracteristica.writeValueWithoutResponse(datos);
+      else await caracteristica.writeValue(datos);
+    } catch (e) {
+      // si falla, se reintenta con el siguiente envío
+    }
+  }
+  enviando = false;
+}
+
+// ----------------- Detección de dedos -----------------
+let aspecto = 4 / 3;
+
+function dist(a, b) {
+  return Math.hypot((a.x - b.x) * aspecto, a.y - b.y);
+}
+
+function dedosLevantados(lm) {
+  const muneca = lm[0];
+  const dedo = (punta, articulacion) => dist(lm[punta], muneca) > dist(lm[articulacion], muneca) * UMBRAL_DEDO;
+
+  const separacionPulgar = dist(lm[4], lm[5]) / dist(lm[0], lm[5]);
+  const pulgar = dist(lm[4], lm[17]) > dist(lm[3], lm[17]) && separacionPulgar > UMBRAL_PULGAR;
+
+  return [pulgar, dedo(8, 6), dedo(12, 10), dedo(16, 14), dedo(20, 18)].map((v) => (v ? 1 : 0));
+}
+
+// ----------------- Resultados de MediaPipe -----------------
+let candidato = null;
+let repeticiones = 0;
+let valorEnviado = null;
+
+function dibujar(manos) {
+  ctx.clearRect(0, 0, lienzo.width, lienzo.height);
+  ctx.strokeStyle = "#ff4fd8";
+  ctx.fillStyle = "#ffffff";
+  ctx.lineWidth = 3;
+  for (const lm of manos) {
+    for (const [a, b] of CONEXIONES) {
+      ctx.beginPath();
+      ctx.moveTo(lm[a].x * lienzo.width, lm[a].y * lienzo.height);
+      ctx.lineTo(lm[b].x * lienzo.width, lm[b].y * lienzo.height);
+      ctx.stroke();
+    }
+    for (const p of lm) {
+      ctx.beginPath();
+      ctx.arc(p.x * lienzo.width, p.y * lienzo.height, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+function alRecibirResultados(res) {
+  const listas = res.multiHandLandmarks || [];
+  dibujar(listas);
+
+  // Cada mano: posición en pantalla (como en un espejo) y número que marca
+  const manos = listas.map((lm) => {
+    const patron = dedosLevantados(lm).join("");
+    return { x: 1 - lm[0].x, patron, digito: GESTOS[patron] };
+  });
+  manos.sort((a, b) => a.x - b.x);
+
+  let dec = 0, uni = 0;
+  if (manos.length === 2) {
+    dec = manos[0].digito;
+    uni = manos[1].digito;
+  } else if (manos.length === 1) {
+    if (manos[0].x < 0.5) dec = manos[0].digito; else uni = manos[0].digito;
+  }
+
+  const lineas = manos.map((m, i) => "Mano " + (i + 1) + ": " + m.patron + (m.digito === undefined ? " (gesto no reconocido)" : " = " + m.digito));
+  $("debug").textContent = manos.length ? "Pulgar, índice, medio, anular, meñique\n" + lineas.join("\n") : "No veo manos (se muestra 00)";
+
+  // Si algún gesto no se reconoce, se ignora ese fotograma
+  if (dec === undefined || uni === undefined) return;
+
+  const numero = dec * 10 + uni;
+  $("dec").textContent = dec;
+  $("uni").textContent = uni;
+  $("numero").textContent = String(numero).padStart(2, "0");
+
+  // Solo se envía cuando el número se mantiene estable unos fotogramas
+  if (numero === candidato) repeticiones++; else { candidato = numero; repeticiones = 1; }
+  if (repeticiones >= FOTOGRAMAS_ESTABLES && numero !== valorEnviado) {
+    valorEnviado = numero;
+    $("enviado").textContent = String(numero).padStart(2, "0");
+    enviar(numero);
+  }
+}
+
+// Reenvío cada segundo, por si la ESP32 se reinicia o se pierde un mensaje
+setInterval(() => { if (valorEnviado !== null) enviar(valorEnviado); }, 1000);
+
+// ----------------- Cámara -----------------
+let manosDetector = null;
+let procesando = false;
+
+async function iniciarCamara() {
+  if (typeof Hands === "undefined") {
+    estado("No cargó MediaPipe. Revisa que la computadora tenga internet y recarga la página.");
+    return;
+  }
+  try {
+    const flujo = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640, height: 480 }, audio: false });
+    video.srcObject = flujo;
+    await video.play();
+  } catch (e) {
+    estado("No se pudo abrir la cámara: " + e.message);
+    return;
+  }
+  lienzo.width = video.videoWidth;
+  lienzo.height = video.videoHeight;
+  aspecto = video.videoWidth / video.videoHeight;
+
+  manosDetector = new Hands({ locateFile: (archivo) => "https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/" + archivo });
+  manosDetector.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+  manosDetector.onResults(alRecibirResultados);
+
+  $("btnCamara").disabled = true;
+  $("btnCamara").textContent = "Cámara activa";
+  estado("Cámara activa. Muestra tus manos: la izquierda marca las decenas y la derecha las unidades.");
+  bucle();
+}
+
+async function bucle() {
+  if (video.readyState >= 2 && !procesando) {
+    procesando = true;
+    try { await manosDetector.send({ image: video }); } catch (e) { estado("Error al detectar las manos: " + e.message); }
+    procesando = false;
+  }
+  requestAnimationFrame(bucle);
+}
+
+$("btnSerial").addEventListener("click", conectarESP32);
+$("btnCamara").addEventListener("click", iniciarCamara);
+</script>
+</body>
+</html>
